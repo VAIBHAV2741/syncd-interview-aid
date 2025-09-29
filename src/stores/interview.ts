@@ -1,6 +1,84 @@
-import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
+import { create } from "zustand";
+import { persist } from "zustand/middleware";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
+// --- Gemini API Setup ---
+const genAI = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY!);
+
+// --- Fetch interview question with dynamic fallback ---
+async function fetchInterviewQuestion(
+  difficulty: "easy" | "medium" | "hard"
+): Promise<string> {
+  try {
+    // Use free-tier Gemini model
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5" });
+
+    const prompt = `Generate one ${difficulty} level interview question for a frontend developer. Only return the question text, nothing else.`;
+
+    const result = await model.generateContent(prompt);
+    const text = result.response?.text?.()?.trim() || result.output?.[0]?.content?.trim();
+    if (!text) throw new Error("Empty response from Gemini");
+
+    return text;
+  } catch (err) {
+    console.error("Gemini API error (fetchInterviewQuestion):", err);
+
+    // Random fallback questions
+    const easyFallbacks = [
+      "Explain the React reconciliation process.",
+      "What is the Virtual DOM in React?",
+      "How does event handling work in JavaScript?",
+    ];
+    const mediumFallbacks = [
+      "Explain React hooks and their use cases.",
+      "How would you optimize a slow React app?",
+      "Difference between controlled and uncontrolled components.",
+    ];
+    const hardFallbacks = [
+      "Explain closure in JavaScript with examples.",
+      "How does React fiber architecture work?",
+      "Implement a debounce function in JS and explain.",
+    ];
+
+    const fallbackList =
+      difficulty === "easy"
+        ? easyFallbacks
+        : difficulty === "medium"
+        ? mediumFallbacks
+        : hardFallbacks;
+
+    return fallbackList[Math.floor(Math.random() * fallbackList.length)];
+  }
+}
+
+// --- Generate questions from resume ---
+export async function generateQuestionsFromResume(
+  resumeText: string,
+  numQuestions: number = 5
+): Promise<string[]> {
+  try {
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5" });
+    const prompt = `Read this resume:\n${resumeText}\nGenerate ${numQuestions} interview questions relevant to this candidate. Only return the questions as a numbered list.`;
+    const result = await model.generateContent(prompt);
+    const text = result.response?.text?.()?.trim() || result.output?.[0]?.content?.trim();
+
+    return text
+      .split(/\n\d+\.\s*/)
+      .filter((q) => q.trim())
+      .map((q) => q.trim());
+  } catch (err) {
+    console.error("Gemini API error (generateQuestionsFromResume):", err);
+    return [
+      "What are your key technical strengths?",
+      "Explain a challenging project you worked on.",
+      "How do you handle debugging complex issues?",
+      "What frameworks are you most comfortable with?",
+      "Where do you see yourself improving technically?",
+    ];
+  }
+}
+
+// --- Candidate Model ---
 export interface Candidate {
   id: string;
   name: string;
@@ -8,61 +86,57 @@ export interface Candidate {
   phone: string;
   resumeFile?: File;
   resumeText?: string;
-  status: 'uploading' | 'collecting-info' | 'interviewing' | 'completed' | 'paused';
+  status:
+    | "uploading"
+    | "collecting-info"
+    | "interviewing"
+    | "completed"
+    | "paused";
   currentQuestion: number;
   timeRemaining: number;
   answers: Array<{
     question: string;
     answer: string;
     timeSpent: number;
-    difficulty: 'easy' | 'medium' | 'hard';
+    difficulty: "easy" | "medium" | "hard";
     score?: number;
   }>;
+  questions?: string[];
   finalScore?: number;
   summary?: string;
   createdAt: Date;
   completedAt?: Date;
 }
 
+// --- Store Shape ---
 interface InterviewState {
   candidates: Candidate[];
-  activeTab: 'interviewee' | 'interviewer';
+  activeTab: "interviewee" | "interviewer";
   currentCandidateId: string | null;
   isInterviewActive: boolean;
-  
-  // Actions
-  setActiveTab: (tab: 'interviewee' | 'interviewer') => void;
-  addCandidate: (candidate: Omit<Candidate, 'id' | 'createdAt'>) => void;
+
+  setActiveTab: (tab: "interviewee" | "interviewer") => void;
+  addCandidate: (candidate: Omit<Candidate, "id" | "createdAt">) => void;
   updateCandidate: (id: string, updates: Partial<Candidate>) => void;
   setCurrentCandidate: (id: string | null) => void;
-  startInterview: (candidateId: string) => void;
+  startInterview: (candidateId: string) => Promise<void>;
   pauseInterview: () => void;
-  submitAnswer: (candidateId: string, answer: string) => void;
-  nextQuestion: (candidateId: string) => void;
-  completeInterview: (candidateId: string, finalScore: number, summary: string) => void;
-  deletCandidate: (id: string) => void;
+  submitAnswer: (candidateId: string, answer: string) => Promise<void>;
+  nextQuestion: (candidateId: string) => Promise<void>;
+  completeInterview: (
+    candidateId: string,
+    finalScore: number,
+    summary: string
+  ) => void;
+  deleteCandidate: (id: string) => void;
 }
 
-const INTERVIEW_QUESTIONS = {
-  easy: [
-    "What is the difference between let, const, and var in JavaScript?",
-    "Explain what React components are and how they work.",
-  ],
-  medium: [
-    "How do you handle state management in a React application?",
-    "Explain the concept of RESTful APIs and HTTP methods.",
-  ],
-  hard: [
-    "Design a scalable system for real-time chat application.",
-    "Explain database indexing and when you would use different types of indexes.",
-  ],
-};
-
+// --- Store Implementation ---
 export const useInterviewStore = create<InterviewState>()(
   persist(
     (set, get) => ({
       candidates: [],
-      activeTab: 'interviewee',
+      activeTab: "interviewee",
       currentCandidateId: null,
       isInterviewActive: false,
 
@@ -90,74 +164,96 @@ export const useInterviewStore = create<InterviewState>()(
 
       setCurrentCandidate: (id) => set({ currentCandidateId: id }),
 
-      startInterview: (candidateId) => {
+      // --- Start interview: pre-generate all questions ---
+      startInterview: async (candidateId) => {
         set({ isInterviewActive: true });
+
+        const difficulties: Array<"easy" | "medium" | "hard"> = [
+          "easy",
+          "easy",
+          "medium",
+          "medium",
+          "hard",
+          "hard",
+        ];
+
+        const questions = await Promise.all(
+          difficulties.map((d) => fetchInterviewQuestion(d))
+        );
+
         get().updateCandidate(candidateId, {
-          status: 'interviewing',
+          status: "interviewing",
           currentQuestion: 0,
-          timeRemaining: 20, // Easy question timer
+          timeRemaining: 20,
+          answers: questions.map((q, idx) => ({
+            question: q,
+            answer: "",
+            timeSpent: 0,
+            difficulty: difficulties[idx],
+          })),
         });
       },
 
       pauseInterview: () => set({ isInterviewActive: false }),
 
-      submitAnswer: (candidateId, answer) => {
-        const state = get();
-        const candidate = state.candidates.find((c) => c.id === candidateId);
+      submitAnswer: async (candidateId, answer) => {
+        const candidate = get().candidates.find((c) => c.id === candidateId);
         if (!candidate) return;
 
-        const questionIndex = candidate.currentQuestion;
-        const difficulty = questionIndex < 2 ? 'easy' : questionIndex < 4 ? 'medium' : 'hard';
-        const questionSet = INTERVIEW_QUESTIONS[difficulty];
-        const question = questionSet[questionIndex < 2 ? questionIndex : questionIndex < 4 ? questionIndex - 2 : questionIndex - 4];
-        
-        const timeSpent = difficulty === 'easy' ? 20 - candidate.timeRemaining :
-                         difficulty === 'medium' ? 60 - candidate.timeRemaining :
-                         120 - candidate.timeRemaining;
+        const currentIndex = candidate.currentQuestion;
+        const currentAnswer = candidate.answers[currentIndex];
+        if (!currentAnswer) return;
 
-        const newAnswer = {
-          question,
+        const timeSpent =
+          currentAnswer.difficulty === "easy"
+            ? 20 - candidate.timeRemaining
+            : currentAnswer.difficulty === "medium"
+            ? 60 - candidate.timeRemaining
+            : 120 - candidate.timeRemaining;
+
+        const updatedAnswers = [...candidate.answers];
+        updatedAnswers[currentIndex] = {
+          ...currentAnswer,
           answer,
           timeSpent,
-          difficulty: difficulty as 'easy' | 'medium' | 'hard',
-          score: Math.floor(Math.random() * 10) + 1, // Mock AI scoring
+          score: Math.floor(Math.random() * 10) + 1, // mock scoring
         };
 
-        const updatedAnswers = [...candidate.answers, newAnswer];
+        get().updateCandidate(candidateId, { answers: updatedAnswers });
 
-        get().updateCandidate(candidateId, {
-          answers: updatedAnswers,
-        });
-
-        // Move to next question or complete
-        if (candidate.currentQuestion < 5) {
+        // Move to next or complete
+        if (currentIndex < candidate.answers.length - 1) {
           get().nextQuestion(candidateId);
         } else {
           const finalScore = Math.floor(
-            updatedAnswers.reduce((sum, a) => sum + (a.score || 0), 0) / updatedAnswers.length
+            updatedAnswers.reduce((sum, a) => sum + (a.score || 0), 0) /
+              updatedAnswers.length
           );
-          const summary = `Candidate completed ${updatedAnswers.length} questions with an average score of ${finalScore}/10. Strong performance in technical concepts.`;
+          const summary = `Candidate completed ${updatedAnswers.length} questions with an average score of ${finalScore}/10.`;
           get().completeInterview(candidateId, finalScore, summary);
         }
       },
 
-      nextQuestion: (candidateId) => {
+      nextQuestion: async (candidateId) => {
         const candidate = get().candidates.find((c) => c.id === candidateId);
         if (!candidate) return;
 
-        const nextQuestionIndex = candidate.currentQuestion + 1;
-        const difficulty = nextQuestionIndex < 2 ? 'easy' : nextQuestionIndex < 4 ? 'medium' : 'hard';
-        const timeLimit = difficulty === 'easy' ? 20 : difficulty === 'medium' ? 60 : 120;
+        const nextIndex = candidate.currentQuestion + 1;
+        if (nextIndex >= candidate.answers.length) return;
+
+        const difficulty = candidate.answers[nextIndex].difficulty;
+        const timeLimit =
+          difficulty === "easy" ? 20 : difficulty === "medium" ? 60 : 120;
 
         get().updateCandidate(candidateId, {
-          currentQuestion: nextQuestionIndex,
+          currentQuestion: nextIndex,
           timeRemaining: timeLimit,
         });
       },
 
       completeInterview: (candidateId, finalScore, summary) => {
         get().updateCandidate(candidateId, {
-          status: 'completed',
+          status: "completed",
           finalScore,
           summary,
           completedAt: new Date(),
@@ -165,29 +261,28 @@ export const useInterviewStore = create<InterviewState>()(
         set({ isInterviewActive: false });
       },
 
-      deletCandidate: (id) =>
+      deleteCandidate: (id) =>
         set((state) => ({
           candidates: state.candidates.filter((c) => c.id !== id),
-          currentCandidateId: state.currentCandidateId === id ? null : state.currentCandidateId,
+          currentCandidateId:
+            state.currentCandidateId === id ? null : state.currentCandidateId,
         })),
     }),
     {
-      name: 'interview-storage',
+      name: "interview-storage",
       version: 1,
     }
   )
 );
 
+// --- Helper: get current question ---
 export const getQuestionForCandidate = (candidate: Candidate) => {
-  const questionIndex = candidate.currentQuestion;
-  const difficulty = questionIndex < 2 ? 'easy' : questionIndex < 4 ? 'medium' : 'hard';
-  const questionSet = INTERVIEW_QUESTIONS[difficulty];
-  const setIndex = questionIndex < 2 ? questionIndex : questionIndex < 4 ? questionIndex - 2 : questionIndex - 4;
-  
+  const index = candidate.currentQuestion;
+  const current = candidate.answers[index];
   return {
-    question: questionSet[setIndex],
-    difficulty,
-    questionNumber: questionIndex + 1,
-    totalQuestions: 6,
+    question: current?.question,
+    difficulty: current?.difficulty,
+    questionNumber: index + 1,
+    totalQuestions: candidate.answers.length,
   };
 };
